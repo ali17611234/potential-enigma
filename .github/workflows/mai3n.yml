@@ -8,27 +8,55 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 360
     steps:
-      - name: Configure system services
+      - name: Configure system services (Enable RDP)
         run: |
+          Write-Host "Enabling Remote Desktop..."
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          # Disable Network Level Authentication (NLA) for easier automated RDP access
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "UserAuthentication" -Value 0
+          Write-Host "RDP and Firewall configured successfully."
 
-      - name: Setup build account
+      - name: Setup and Verify Admin Access
         run: |
-          $Password = ConvertTo-SecureString "Cynet@2026" -AsPlainText -Force
-          New-LocalUser -Name "CynetAdmin" -Password $Password -PasswordNeverExpires -ErrorAction SilentlyContinue
-          Add-LocalGroupMember -Group "Administrators" -Member "CynetAdmin" -ErrorAction SilentlyContinue
-          net user runneradmin Cynet@2026
+          $Password = "Cynet@2026"
+          $SecurePassword = ConvertTo-SecureString $Password -AsPlainText -Force
 
-      - name: Install network tools
+          # 1. Guarantee access via the built-in runneradmin account (which is already an admin)
+          Write-Host "Setting password for built-in runneradmin account..."
+          net user runneradmin $Password
+
+          # 2. Create CynetAdmin, or update it if it already exists
+          $userExists = Get-LocalUser -Name "CynetAdmin" -ErrorAction SilentlyContinue
+          if (-not $userExists) {
+              Write-Host "Creating CynetAdmin user..."
+              New-LocalUser -Name "CynetAdmin" -Password $SecurePassword -PasswordNeverExpires
+          } else {
+              Write-Host "CynetAdmin already exists. Updating password..."
+              Set-LocalUser -Name "CynetAdmin" -Password $SecurePassword
+          }
+
+          # 3. Force add to Administrators group (net localgroup is more reliable in CI than Add-LocalGroupMember)
+          Write-Host "Ensuring CynetAdmin is in the Administrators group..."
+          net localgroup Administrators CynetAdmin /add
+          
+          # 4. Verify admin status and print to logs so you can confirm it worked
+          Write-Host "Verifying admin group membership..."
+          net localgroup Administrators | Select-String "CynetAdmin"
+          net localgroup Administrators | Select-String "runneradmin"
+          
+          Write-Host "Admin access setup complete."
+
+      - name: Install network tools (Tailscale)
         env:
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
         run: |
+          Write-Host "Downloading Tailscale..."
           Invoke-WebRequest "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile "C:\tailscale.msi"
           Start-Process msiexec -ArgumentList "/i C:\tailscale.msi /quiet /norestart" -Wait
           
           Start-Sleep -Seconds 5
+          Write-Host "Authenticating Tailscale..."
           & "C:\Program Files\Tailscale\tailscale.exe" up --authkey="$Env:TAILSCALE_AUTHKEY" --hostname="win-build-$env:GITHUB_RUN_ID"
           
           Start-Sleep -Seconds 8
@@ -37,15 +65,16 @@ jobs:
           
           Write-Host ""
           Write-Host "=================================================="
-          Write-Host "  Build node ready"
+          Write-Host "  Build node ready for RDP"
           Write-Host "  Node IP     : $ts_ip"
-          Write-Host "  Username    : CynetAdmin"
+          Write-Host "  Username    : CynetAdmin  (or runneradmin)"
           Write-Host "  Password    : Cynet@2026"
           Write-Host "=================================================="
 
-      - name: Run continuous tests
+      - name: Run continuous tests (Keep-alive)
         run: |
+          Write-Host "Starting 360-minute keep-alive loop..."
           for ($i = 1; $i -le 360; $i++) {
             Start-Sleep -Seconds 60
-            Write-Host "[$i/360] Test cycle running..."
+            Write-Host "[$i/360] Build node is alive and RDP accessible."
           }
